@@ -1,0 +1,176 @@
+Flash Sale Engine
+
+A NestJS monorepo that handles a high-traffic online "flash sale". Customers fill a cart and submit it as an order. Stock is checked and reserved in Redis so the API stays fast, and everything slow (saving the order, sending emails) happens in a separate background service.
+
+Stack: NestJS, TypeScript, MySQL (TypeORM), Redis (stock cache + Pub/Sub), BullMQ (job queue), Resend (email), JWT auth.
+
+Architecture
+ Customer
+    |
+    v
++----------------------+                       +---------------------------+
+|  flash-sale (API)    |                       |  fulfillment-service      |
+|                      |                       |                           |
+|  1. read cart (MySQL)|                       |  1. receive event         |
+|  2. DECRBY stock     |   order.created       |  2. save order + items    |
+|     in Redis         | --- Redis Pub/Sub --> |     (MySQL transaction)   |
+|  3. publish event    |                       |  3. add job to BullMQ     |
+|  4. clear cart       |                       |  4. worker sends email    |
+|  5. return 202       |                       |     (retries on failure)  |
++----------------------+                       |  5. daily cron: emails    |
+                                               |     abandoned carts       |
+                                               +---------------------------+
+App / lib	Path	Responsibility
+flash-sale	apps/flash-sale	REST API: auth, products, carts, orders, inventory
+fulfillment-service	apps/fulfillment-service	Event subscriber, order persistence, BullMQ worker, cron job
+common	libs/common	Shared Redis service and the OrderCreatedEvent contract
+Why it is built this way
+Redis DECRBY is atomic, so thousands of simultaneous buyers cannot oversell stock, and the stock check never touches MySQL.
+Cache-aside stock loading: the first order for a product loads its stock from MySQL into Redis. Nothing is loaded at startup.
+Pub/Sub decouples the apps. The API does not wait for the database write or the email.
+BullMQ makes emails reliable. Failed sends are retried with exponential backoff (5s, 15s, 45s). Permanent errors (such as an invalid address) are not retried.
+The server computes prices and reads the customer from the JWT. The client never sends a total or an email.
+Requirements
+Node.js 20 or newer
+Docker (for MySQL and Redis), or your own MySQL 8 and Redis 7 instances
+A free Resend account and API key
+Setup
+1. Install dependencies
+bash
+npm install
+2. Configure the environment
+
+Copy the example file and fill it in:
+
+bash
+cp .env.example .env
+Variable	Description
+DB_HOST, DB_PORT	MySQL host and port
+DB_USERNAME, DB_PASSWORD	MySQL credentials
+DB_NAME	Database name (flash_sale_db)
+JWT_SECRET	Long random string used to sign tokens
+RESEND_API_KEY	Your Resend API key (starts with re_)
+ABANDONED_AFTER_MINUTES	Optional. Minutes before a cart counts as abandoned (default 1440, which is 24 hours)
+
+Never commit .env. It is listed in .gitignore.
+
+3. Start MySQL and Redis
+bash
+docker compose up -d
+
+This creates the database from db/schema.sql and loads sample products from db/seed.sql. It runs once, the first time the MySQL container is created.
+
+If you use your own MySQL, run db/schema.sql yourself. The project uses synchronize: false, so TypeORM never changes your tables.
+
+4. Run the two services
+
+Use two terminals from the project root:
+
+bash
+nest start flash-sale --watch
+bash
+nest start fulfillment-service --watch
+
+The API listens on http://localhost:3000/api/v1 unless you changed the port.
+
+5. Create the admin account
+
+There is exactly one way to become an admin: promote an account in the database. The register endpoint never accepts a role.
+
+Register a normal user with POST /api/v1/auth/register.
+Promote it:
+sql
+UPDATE customers SET role = 'ADMIN' WHERE email = 'admin@example.com';
+Log in again. The role is stored inside the token, so an old token keeps its old role until it expires.
+API
+
+Base path: /api/v1. Protected routes need the header Authorization: Bearer <accessToken>.
+
+Method	Route	Access	Description
+POST	/auth/register	Public	Create a customer account (and its cart)
+POST	/auth/login	Public	Returns an accessToken
+GET	/products	Public	List products
+GET	/products/:id	Public	Get one product
+POST	/products	Admin	Create a product (with initial stock)
+PATCH	/products/:id	Admin	Update a product
+DELETE	/products/:id	Admin	Delete a product
+PATCH	/products/:id/stock	Admin	Add stock to a product
+GET, POST	/inventory/:productId/stock	Admin	Read or set the Redis stock directly
+POST	/carts/items	Customer	Add a product to your cart { "productId": 3, "quantity": 1 }
+GET	/carts	Customer	View your cart
+POST	/orders	Customer	Submit your cart as an order (no body needed)
+Order responses
+Status	Meaning
+202 Accepted	Order placed. It is saved and emailed in the background
+400 Bad Request	Cart is empty, or Out of stock: <product>
+401 Unauthorized	Missing or invalid token
+403 Forbidden	Admin-only route called by a regular customer
+Background jobs
+
+Order receipt. When fulfillment-service receives order.created, it saves the order and its items in one transaction, subtracts the quantities from products.stock, and queues an order-receipt job in notifications-queue. The worker sends an HTML receipt through Resend.
+
+Retry rules. Each job has 4 attempts (1 try + 3 retries) with delays of 5s, 15s and 45s. Server errors (5xx) and rate limits (429) are retried. Other 4xx errors fail immediately.
+
+Abandoned carts. A cron job queries carts that are ACTIVE, not empty, and untouched for 24 hours. For each one it queues an abandoned-cart email and marks the cart ABANDONED, so nobody is emailed twice. Adding a new item sets the cart back to ACTIVE.
+
+By default the cron runs at midnight (CronExpression.EVERY_DAY_AT_MIDNIGHT). For a demo, switch it to EVERY_MINUTE in abandoned-cart.cron.ts and set ABANDONED_AFTER_MINUTES=1.
+
+Demo and tests
+Flash sale test: 5 orders accepted, 5 rejected
+Set the stock for your test product (edit PRODUCT_ID at the top of scripts/flash-test.js to match):
+sql
+UPDATE products SET stock = 5 WHERE id = 3;
+Clear the Redis key so the stock reloads from MySQL:
+bash
+docker exec -it redis redis-cli DEL item:3:stock
+Run the script. It registers 10 users, fills each cart, and fires all 10 orders at the same moment:
+bash
+node scripts/flash-test.js
+
+Expected result: five 202 and five 400 Out of stock.
+
+Check the stock: docker exec -it redis redis-cli GET item:3:stock should print 0.
+
+The test users have @example.com addresses, so their receipt emails fail on purpose (see the Resend note below). That does not affect the stock test.
+
+Email receipt test
+Register a customer with the same email address as your Resend account.
+Log in, add a product to the cart, and call POST /orders.
+The fulfillment terminal shows Saved order ..., then completed. The receipt arrives in your inbox. Check the spam folder, because Resend's test sender is often filtered.
+Retry test
+
+Temporarily add throw new Error('fake 5xx'); as the first line of sendReceipt in notifications.processor.ts, then place an order. The log shows attempts 1/4 to 4/4 about 5s, 15s and 45s apart. Remove the line afterwards.
+
+Abandoned cart test
+
+Add an item to a cart without ordering, then backdate it:
+
+sql
+UPDATE carts SET last_updated_at = NOW() - INTERVAL 2 DAY WHERE id = 1;
+
+Within a minute (with the cron set to every minute) the fulfillment terminal logs Found 1 abandoned cart(s) and the email is sent.
+
+Known limitations
+Pub/Sub does not store messages. If fulfillment-service is down or a handler fails when an order is published, the customer has received 202 but no order is saved. A durable queue or the transactional outbox pattern would fix this.
+Redis and MySQL can drift. Stock is decremented in Redis immediately and in MySQL later. Lost events leave them out of sync. A reconciliation job would correct this.
+A cart can be submitted twice at the same time. Nothing locks the cart during checkout.
+The cron marks a cart ABANDONED even if its email later fails.
+Resend free tier only delivers to the email address you signed up with. A real deployment needs a verified domain and a from address on it.
+Redis should not evict or expire stock keys during a sale. Run it with --appendonly yes and maxmemory-policy noeviction.
+Project structure
+flash-sale-monorepo/
+├── apps/
+│   ├── flash-sale/                 # REST API
+│   │   └── src/{auth,carts,customers,inventory,orders,products}
+│   └── fulfillment-service/        # Subscriber, worker, cron
+│       └── src/{notifications,orders}
+├── libs/
+│   └── common/                     # Redis service, shared event types
+├── db/
+│   ├── schema.sql                  # Database structure
+│   └── seed.sql                    # Sample products
+├── scripts/
+│   └── flash-test.js               # Concurrency test
+├── docker-compose.yml
+├── .env.example
+└── nest-cli.json

@@ -54,4 +54,25 @@ async publish(channel: string, payload: unknown): Promise<number> {
   async onModuleDestroy(): Promise<void> {
     await this.client.quit();
   }
+
+  // Subtract only if enough stock exists. Returns the new stock, or -1 if not enough.
+private static readonly RESERVE_SCRIPT = `
+local stock = tonumber(redis.call('GET', KEYS[1]))
+if stock == nil or stock < tonumber(ARGV[1]) then
+  return -1
+end
+return redis.call('DECRBY', KEYS[1], ARGV[1])
+`;
+
+/** Returns the remaining stock, or null if there wasn't enough (nothing was taken). */
+async reserveStock(productId: number, quantity: number): Promise<number | null> {
+  const result = (await this.client.eval(
+    RedisService.RESERVE_SCRIPT,
+    1,
+    this.inventoryKey(productId),
+    quantity,
+  )) as number;
+
+  return result < 0 ? null : result;
+}
 }

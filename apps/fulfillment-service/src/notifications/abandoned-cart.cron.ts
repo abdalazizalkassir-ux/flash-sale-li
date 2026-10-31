@@ -19,8 +19,7 @@ export class AbandonedCartCron {
     @InjectDataSource() private readonly dataSource: DataSource,
   ) {}
 
-  // Every minute for the demo. For the final version use:
-  // @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
+  
   @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
   async enqueueAbandonedCarts() {
     const minutes = Number(process.env.ABANDONED_AFTER_MINUTES ?? 1440); // 1440 = 24 hours

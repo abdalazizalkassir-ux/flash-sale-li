@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger,ServiceUnavailableException } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { ORDER_CREATED_CHANNEL, RedisService } from '@app/common';
@@ -41,18 +41,17 @@ export class OrdersService {
     let event: OrderCreatedEvent;
 
     try {
-      for (const item of cart.items) {
-        const productId = Number(item.product.id);
+for (const item of cart.items) {
+  const productId = Number(item.product.id);
 
-        await this.products.ensureStockCached(productId);
-        const remaining = await this.redis.decrementStock(productId, item.quantity);
-        reserved.push({ productId, quantity: item.quantity });
+  await this.products.ensureStockCached(productId);
 
-        if (remaining < 0) {
-          throw new BadRequestException(`Out of stock: ${item.product.name}`);
-        }
-      }
-
+  const remaining = await this.redis.reserveStock(productId, item.quantity);
+  if (remaining === null) {
+    throw new BadRequestException(`Out of stock: ${item.product.name}`);
+  }
+  reserved.push({ productId, quantity: item.quantity });
+}
       const items = cart.items.map((i) => ({
         productId: Number(i.product.id),
         productName: i.product.name,
@@ -71,7 +70,12 @@ export class OrdersService {
         createdAt: new Date().toISOString(),
       };
 
-      await this.redis.publish(ORDER_CREATED_CHANNEL, event);
+const receivers = await this.redis.publish(ORDER_CREATED_CHANNEL, event);
+if (receivers === 0) {
+  throw new ServiceUnavailableException(
+    'Order processing is unavailable. Please try again shortly.',
+  );
+}
     } catch (err) {
       await release();
       throw err;
